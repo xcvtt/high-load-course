@@ -43,9 +43,9 @@ class PaymentExternalSystemAdapterImpl(
 
     private val deadlineOngoingWindow = DeadlineOngoingWindow(parallelRequests)
 
-    private val initialBackoff = Duration.ofSeconds(1)
+    private val initialBackoff = Duration.ofMillis(80.toLong())
     private val backoffCoefficient = 1.5
-    private val maxRequestRetries = 5
+    private val maxRequestRetries = 3
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
@@ -97,6 +97,10 @@ class PaymentExternalSystemAdapterImpl(
 
                         backoff = Duration.ofMillis(((backoff.toMillis() * backoffCoefficient).toLong()));
                         retryCount++;
+
+                        if (retryCount == maxRequestRetries) {
+                            logger.warn("[$accountName] [RETRY] txId: $transactionId, retries didn't help")
+                        }
                     } else {
                         // Exit loop if ok :)
                         retryCount = 10000000;
