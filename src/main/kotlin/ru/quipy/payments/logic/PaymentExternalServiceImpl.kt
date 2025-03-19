@@ -12,8 +12,7 @@ import ru.quipy.payments.api.PaymentAggregate
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
-import java.util.concurrent.Semaphore
-import java.util.concurrent.TimeUnit
+import java.util.concurrent.*
 
 
 // Advice: always treat time as a Duration
@@ -59,19 +58,6 @@ class PaymentExternalSystemAdapterImpl(
             it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
         }
 
-        if (!deadlineOngoingWindow.acquire(deadline)) {
-            logger.warn("[$accountName] Deadline exceeded, cancelling request, deadline: $deadline")
-
-            paymentESService.update(paymentId) {
-                it.logProcessing(false, now(), transactionId, reason = "Deadline exceeded.")
-            }
-            return
-        }
-
-        while (!rateLimiter.tick())
-            Thread.sleep(5)
-
-
         val request = Request.Builder().run {
             url("http://localhost:1234/external/process?serviceName=${serviceName}&accountName=${accountName}&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
             post(emptyBody)
@@ -82,37 +68,26 @@ class PaymentExternalSystemAdapterImpl(
 
         while (retryCount < maxRequestRetries) {
             try {
-                client.newCall(request).execute().use { response ->
-                    val body = try {
-                        mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
-                    } catch (e: Exception) {
-                        logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}, reason: ${response.body?.string()}")
-                        ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
+                val body = performHedgedRequest(client, request, mapper, transactionId, paymentId, accountName, requestAverageProcessingTime.toMillis() * 2, deadline)
+
+                if (!body.result) {
+                    logger.warn("[$accountName] [RETRY] txId: $transactionId, retryCount: $retryCount, backoff: $backoff")
+
+                    Thread.sleep(backoff)
+                    backoff = Duration.ofMillis((backoff.toMillis() * backoffCoefficient).toLong())
+                    retryCount++
+
+                    if (retryCount == maxRequestRetries) {
+                        logger.warn("[$accountName] [RETRY] txId: $transactionId, retries didn't help")
                     }
+                } else {
+                    retryCount = 10000000
+                }
 
-                    if (!body.result) {
-                        logger.warn("[$accountName] [RETRY] txId: $transactionId, retryCount: $retryCount, backoff: $backoff")
+                logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
 
-                        Thread.sleep(backoff)
-
-                        backoff = Duration.ofMillis(((backoff.toMillis() * backoffCoefficient).toLong()));
-                        retryCount++;
-
-                        if (retryCount == maxRequestRetries) {
-                            logger.warn("[$accountName] [RETRY] txId: $transactionId, retries didn't help")
-                        }
-                    } else {
-                        // Exit loop if ok :)
-                        retryCount = 10000000;
-                    }
-
-                    logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
-
-                    // Здесь мы обновляем состояние оплаты в зависимости от результата в базе данных оплат.
-                    // Это требуется сделать ВО ВСЕХ ИСХОДАХ (успешная оплата / неуспешная / ошибочная ситуация)
-                    paymentESService.update(paymentId) {
-                        it.logProcessing(body.result, now(), transactionId, reason = body.message)
-                    }
+                paymentESService.update(paymentId) {
+                    it.logProcessing(body.result, now(), transactionId, reason = body.message)
                 }
             } catch (e: Exception) {
                 when (e) {
@@ -137,6 +112,86 @@ class PaymentExternalSystemAdapterImpl(
         }
 
     }
+
+    private fun performHedgedRequest(
+        client: OkHttpClient,
+        request: Request,
+        mapper: ObjectMapper,
+        transactionId: UUID,
+        paymentId: UUID,
+        accountName: String,
+        hedgedTimeoutMs: Long,
+        deadline: Long
+    ): ExternalSysResponse {
+        val executor = Executors.newCachedThreadPool()
+        val idempotencyKey = UUID.randomUUID().toString()
+        val requestWithIdempotency = request.newBuilder()
+            .header("x-idempotency-key", idempotencyKey)
+            .build()
+
+        return try {
+            val firstCall = executor.submit<ExternalSysResponse> {
+                executeRequest(client, requestWithIdempotency, mapper, transactionId, paymentId, accountName, deadline)
+            }
+
+            var secondCall: Future<ExternalSysResponse>? = null
+
+            try {
+                firstCall.get(hedgedTimeoutMs, TimeUnit.MILLISECONDS)
+            } catch (e: TimeoutException) {
+                logger.warn("[$accountName] First call exceeded ${hedgedTimeoutMs}ms, sending hedged request")
+                secondCall = executor.submit<ExternalSysResponse> {
+                    executeRequest(client, requestWithIdempotency, mapper, transactionId, paymentId, accountName, deadline)
+                }
+
+                CompletableFuture.anyOf(
+                    CompletableFuture.supplyAsync { firstCall.get() },
+                    CompletableFuture.supplyAsync { secondCall.get() }
+                ).get() as ExternalSysResponse
+            }
+        } catch (e: Exception) {
+            logger.error("[$accountName] Hedged request failed for txId: $transactionId, payment: $paymentId", e)
+            ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
+        }
+    }
+
+    private fun executeRequest(
+        client: OkHttpClient,
+        request: Request,
+        mapper: ObjectMapper,
+        transactionId: UUID,
+        paymentId: UUID,
+        accountName: String,
+        deadline: Long
+    ): ExternalSysResponse {
+        if (!deadlineOngoingWindow.acquire(deadline)) {
+            logger.warn("[$accountName] Deadline exceeded, cancelling request, deadline: $deadline")
+
+            paymentESService.update(paymentId) {
+                it.logProcessing(false, now(), transactionId, reason = "Deadline exceeded.")
+            }
+
+            return ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, "deadline bad")
+        }
+
+        try {
+            while (!rateLimiter.tick()) {
+                Thread.sleep(5)
+            }
+
+            return client.newCall(request).execute().use { response ->
+                try {
+                    mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
+                } catch (e: Exception) {
+                    logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}, reason: ${response.body?.string()}")
+                    ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
+                }
+            }
+        } finally {
+            deadlineOngoingWindow.release()
+        }
+    }
+
 
     override fun price() = properties.price
 
