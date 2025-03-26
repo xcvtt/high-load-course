@@ -46,6 +46,8 @@ class PaymentExternalSystemAdapterImpl(
     private val backoffCoefficient = 1.5
     private val maxRequestRetries = 3
 
+    private val executor: ExecutorService = Executors.newFixedThreadPool(parallelRequests)
+
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
 
@@ -58,56 +60,73 @@ class PaymentExternalSystemAdapterImpl(
             it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
         }
 
-        val request = Request.Builder().run {
-            url("http://localhost:1234/external/process?serviceName=${serviceName}&accountName=${accountName}&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
-            post(emptyBody)
-        }.build()
+        executor.submit {
+            val request = Request.Builder().run {
+                url("http://localhost:1234/external/process?serviceName=${serviceName}&accountName=${accountName}&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
+                post(emptyBody)
+            }.build()
 
-        var retryCount = 0;
-        var backoff = initialBackoff;
+            var retryCount = 0;
+            var backoff = initialBackoff;
 
-        while (retryCount < maxRequestRetries) {
-            try {
-                val body = performHedgedRequest(client, request, mapper, transactionId, paymentId, accountName, requestAverageProcessingTime.toMillis() * 2, deadline)
+            while (retryCount < maxRequestRetries) {
+                try {
+                    val body = performHedgedRequest(
+                        client,
+                        request,
+                        mapper,
+                        transactionId,
+                        paymentId,
+                        accountName,
+                        requestAverageProcessingTime.toMillis() * 2,
+                        deadline
+                    )
 
-                if (!body.result) {
-                    logger.warn("[$accountName] [RETRY] txId: $transactionId, retryCount: $retryCount, backoff: $backoff")
+                    if (!body.result) {
+                        logger.warn("[$accountName] [RETRY] txId: $transactionId, retryCount: $retryCount, backoff: $backoff")
 
-                    Thread.sleep(backoff)
-                    backoff = Duration.ofMillis((backoff.toMillis() * backoffCoefficient).toLong())
-                    retryCount++
+                        Thread.sleep(backoff)
+                        backoff = Duration.ofMillis((backoff.toMillis() * backoffCoefficient).toLong())
+                        retryCount++
 
-                    if (retryCount == maxRequestRetries) {
-                        logger.warn("[$accountName] [RETRY] txId: $transactionId, retries didn't help")
+                        if (retryCount == maxRequestRetries) {
+                            logger.warn("[$accountName] [RETRY] txId: $transactionId, retries didn't help")
+                        }
+                    } else {
+                        retryCount = 10000000
                     }
-                } else {
-                    retryCount = 10000000
-                }
 
-                logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
+                    logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
 
-                paymentESService.update(paymentId) {
-                    it.logProcessing(body.result, now(), transactionId, reason = body.message)
-                }
-            } catch (e: Exception) {
-                when (e) {
-                    is SocketTimeoutException -> {
-                        logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId", e)
-                        paymentESService.update(paymentId) {
-                            it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
+                    paymentESService.update(paymentId) {
+                        it.logProcessing(body.result, now(), transactionId, reason = body.message)
+                    }
+                } catch (e: Exception) {
+                    when (e) {
+                        is SocketTimeoutException -> {
+                            logger.error(
+                                "[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId",
+                                e
+                            )
+                            paymentESService.update(paymentId) {
+                                it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
+                            }
+                        }
+
+                        else -> {
+                            logger.error(
+                                "[$accountName] Payment failed for txId: $transactionId, payment: $paymentId",
+                                e
+                            )
+
+                            paymentESService.update(paymentId) {
+                                it.logProcessing(false, now(), transactionId, reason = e.message)
+                            }
                         }
                     }
-
-                    else -> {
-                        logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", e)
-
-                        paymentESService.update(paymentId) {
-                            it.logProcessing(false, now(), transactionId, reason = e.message)
-                        }
-                    }
+                } finally {
+                    deadlineOngoingWindow.release()
                 }
-            } finally {
-                deadlineOngoingWindow.release()
             }
         }
 
