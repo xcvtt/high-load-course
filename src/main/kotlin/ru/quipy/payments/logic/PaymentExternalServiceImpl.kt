@@ -106,8 +106,6 @@ class PaymentExternalSystemAdapterImpl(
                         }
                     }
                 }
-            } finally {
-                deadlineOngoingWindow.release()
             }
         }
 
